@@ -3,6 +3,7 @@
 import re
 import json
 import logging
+from json import JSONDecodeError
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Tuple, Union, Optional
 
 from llama_index.core.graph_stores.types import GraphStore
@@ -157,7 +158,7 @@ class ApacheAGEGraphStore(GraphStore):
     @property
     def client(self) -> None:
         return self._driver
-    
+
     def get_schema(self, refresh: bool = False) -> str:
         """Get the schema of the Apache AGE Graph store."""
         if self.schema and not refresh:
@@ -197,6 +198,68 @@ class ApacheAGEGraphStore(GraphStore):
                 )
 
         return triplets
+
+    def query(self, query: str, param_map: Optional[Dict[str, Any]] = {}) -> Any:
+        """
+        Query the graph by taking a cypher query, converting it to an
+        age compatible query, executing it and converting the result
+
+        Args:
+            query (str): a cypher query to be executed
+            params (dict): parameters for the query (not used in this implementation)
+
+        Returns:
+            List[Dict[str, Any]]: a list of dictionaries containing the result set
+        """
+        try:
+            import psycopg2
+        except ImportError as e:
+            raise ImportError(
+                "Unable to import psycopg2, please install with "
+                "`pip install -U psycopg2`."
+            ) from e
+
+        # convert cypher query to pgsql/age query
+        wrapped_query = self._wrap_query(query, self.graph_name)
+
+        # execute the query, rolling back on an error
+        with self._get_cursor() as curs:
+            try:
+                curs.execute(wrapped_query)
+                self._driver.commit()
+            except psycopg2.Error as e:
+                self._driver.rollback()
+                raise AGEQueryException(
+                    {
+                        "message": "Error executing graph query: {}".format(query),
+                        "detail": str(e),
+                    }
+                )
+
+            data = curs.fetchall()
+            if data is None:
+                result = []
+            # convert to dictionaries
+            else:
+                try:
+                    result = [self._record_to_dict(d) for d in data]
+                except JSONDecodeError as e:
+                    logger.error(e)
+                    logger.error(
+                        "Failed to convert to dict, returning NamedTuple. Try to return only simple data types."
+                    )
+                    result = [d for d in data]
+                except Exception as e:
+                    logger.error(e)
+                    logger.error("Failed to convert to dict after query.")
+                    raise AGEQueryException(
+                        {
+                            "message": "Failed to convert to dict after query.",
+                            "detail": str(e),
+                        }
+                    )
+
+            return result
 
     def get_labels(self) -> Tuple[List[str], List[str]]:
         """
@@ -280,7 +343,7 @@ class ApacheAGEGraphStore(GraphStore):
                     )
 
         return triplets
-    
+
     def get_triplets_from_edge_labels_str(self, edge_labels: List[str]) -> List[str]:
         """
         Get a set of distinct relationship types (as a list of strings) in the graph
@@ -297,7 +360,7 @@ class ApacheAGEGraphStore(GraphStore):
         triplets = self.get_triplets_from_edge_labels(edge_labels)
 
         return self._format_triplets(triplets)
-    
+
     @staticmethod
     def _format_triplets(triplets: List[Dict[str, str]]) -> List[str]:
         """
@@ -315,3 +378,147 @@ class ApacheAGEGraphStore(GraphStore):
         triplet_schema = [triplet_template.format(**triplet) for triplet in triplets]
 
         return triplet_schema
+
+    @staticmethod
+    def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
+        """
+        Convert a record returned from an age query to a dictionary
+
+        Args:
+            record (): a record from an age query result
+
+        Returns:
+            Dict[str, Any]: a dictionary representation of the record where
+                the dictionary key is the field name and the value is the
+                value converted to a python type
+        """
+        # result holder
+        d = {}
+
+        # prebuild a mapping of vertex_id to vertex mappings to be used
+        # later to build edges
+        vertices = {}
+        for k in record._fields:
+            v = getattr(record, k)
+            # agtype comes back '{key: value}::type' which must be parsed
+            if isinstance(v, str) and "::" in v:
+                dtype = v.split("::")[-1]
+                v = v.split("::")[0]
+                if dtype == "vertex":
+                    vertex = json.loads(v)
+                    vertices[vertex["id"]] = vertex.get("properties")
+
+        # iterate returned fields and parse appropriately
+        for k in record._fields:
+            v = getattr(record, k)
+            if isinstance(v, str) and "::" in v:
+                dtype = v.split("::")[-1]
+                v = v.split("::")[0]
+            else:
+                dtype = ""
+
+            if dtype == "vertex":
+                d[k] = json.loads(v).get("properties")
+            # convert edge from id-label->id by replacing id with node information
+            # we only do this if the vertex was also returned in the query
+            # this is an attempt to be consistent with neo4j implementation
+            elif dtype == "edge":
+                edge = json.loads(v)
+                d[k] = (
+                    vertices.get(edge["start_id"], {}),
+                    edge["label"],
+                    vertices.get(edge["end_id"], {}),
+                )
+            else:
+                d[k] = json.loads(v) if isinstance(v, str) else v
+
+        return d
+
+    @staticmethod
+    def _get_col_name(field: str, idx: int) -> str:
+        """
+        Convert a cypher return field to a pgsql select field
+        If possible keep the cypher column name, but create a generic name if necessary
+
+        Args:
+            field (str): a return field from a cypher query to be formatted for pgsql
+            idx (int): the position of the field in the return statement
+
+        Returns:
+            str: the field to be used in the pgsql select statement
+        """
+        # remove white space
+        field = field.strip()
+        # if an alias is provided for the field, use it
+        if " as " in field:
+            return field.split(" as ")[-1].strip()
+        # if the return value is an unnamed primitive, give it a generic name
+        elif field.isnumeric() or field in ("true", "false", "null"):
+            return f"column_{idx}"
+        # otherwise return the value stripping out some common special chars
+        else:
+            return field.replace("(", "_").replace(")", "")
+
+    @staticmethod
+    def _wrap_query(query: str, graph_name: str) -> str:
+        """
+        Convert a cypher query to an Apache Age compatible
+        sql query by wrapping the cypher query in ag_catalog.cypher,
+        casting results to agtype and building a select statement
+
+        Args:
+            query (str): a valid cypher query
+            graph_name (str): the name of the graph to query
+
+        Returns:
+            str: an equivalent pgsql query
+        """
+
+        # pgsql template
+        template = """SELECT {projection} FROM ag_catalog.cypher('{graph_name}', $$
+            {query}
+        $$) AS ({fields});"""
+
+        # if there are any returned fields they must be added to the pgsql query
+        if "return" in query.lower():
+            # parse return statement to identify returned fields
+            fields = (
+                query.lower()
+                .split("return")[-1]
+                .split("distinct")[-1]
+                .split("order by")[0]
+                .split("skip")[0]
+                .split("limit")[0]
+                .split(",")
+            )
+
+            # raise exception if RETURN * is found as we can't resolve the fields
+            if "*" in [x.strip() for x in fields]:
+                raise ValueError(
+                    "AGE graph does not support 'RETURN *'"
+                    + " statements in Cypher queries"
+                )
+
+            # get pgsql formatted field names
+            fields = [
+                ApacheAGEGraphStore._get_col_name(field, idx)
+                for idx, field in enumerate(fields)
+            ]
+
+            # build resulting pgsql relation
+            fields_str = ", ".join(
+                [field.split(".")[-1] + " agtype" for field in fields]
+            )
+
+        # if no return statement we still need to return a single field of type agtype
+        else:
+            fields_str = "a agtype"
+
+        select_str = "*"
+
+        return template.format(
+            graph_name=graph_name,
+            query=query,
+            fields=fields_str,
+            projection=select_str,
+        )
