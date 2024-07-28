@@ -272,3 +272,38 @@ class ApacheAGEGraphStore(GraphStore):
                     )
 
         return triplets
+    
+    def get_triplets_from_edge_labels_str(self, edge_labels: List[str]) -> List[str]:
+        """
+        Get a set of distinct relationship types (as a list of strings) in the graph
+        from the edge labels
+
+        Args:
+            edge_labels (List[str]): a list of edge labels to filter for
+
+        Returns:
+            List[str]: relationships as a list of strings in the format
+                "(:`<from_label>`)-[:`<edge_label>`]->(:`<to_label>`)"
+        """
+
+        triplets = self.get_triplets_from_edge_labels(edge_labels)
+
+        return self._format_triplets(triplets)
+    
+    @staticmethod
+    def _format_triplets(triplets: List[Dict[str, str]]) -> List[str]:
+        """
+        Convert a list of relationships from dictionaries to formatted strings
+
+        Args:
+            triplets (List[Dict[str,str]]): a list relationships in the form
+                {'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}
+
+        Returns:
+            List[str]: a list of relationships in the form
+                "(:`<from_label>`)-[:`<edge_label>`]->(:`<to_label>`)"
+        """
+        triplet_template = "(:`{start}`)-[:`{type}`]->(:`{end}`)"
+        triplet_schema = [triplet_template.format(**triplet) for triplet in triplets]
+
+        return triplet_schema
