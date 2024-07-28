@@ -35,7 +35,7 @@ packages = [{include = "llama_index/"}]
 [tool.poetry.dependencies]
 python = ">=3.8.1,<4.0"
 llama-index-core = "^0.10.0"
-apache-age-python = "^0.0.7"
+psycopg2 = "^2.9.9"
 
 [tool.poetry.group.dev.dependencies]
 black = {extras = ["jupyter"], version = "<=23.9.1,>=23.7.0"}
