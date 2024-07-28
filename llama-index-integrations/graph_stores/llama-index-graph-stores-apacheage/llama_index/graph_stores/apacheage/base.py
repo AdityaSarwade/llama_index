@@ -57,7 +57,7 @@ class ApacheAGEGraphStore(GraphStore):
     ) -> None:
         """
         Create a new AGEGraph instance.
-        
+
         Args:
         graph_name (str): the name of the graph to connect to or create
         conf (Dict[str, Any]): the pgsql connection config passed directly
@@ -158,28 +158,6 @@ class ApacheAGEGraphStore(GraphStore):
     def client(self) -> None:
         return self._driver
 
-    def _get_labels(self) -> Tuple[List[str], List[str]]:
-        """
-        Get all labels of a graph (for both edges and vertices)
-        by querying the graph metadata table directly
-
-        Returns
-            Tuple[List[str]]: 2 lists, the first containing vertex
-                labels and the second containing edge labels
-        """
-
-        e_labels_records = self.query(
-            """MATCH ()-[e]-() RETURN collect(distinct label(e)) as labels"""
-        )
-        e_labels = e_labels_records[0]["labels"] if e_labels_records else []
-
-        n_labels_records = self.query(
-            """MATCH (n) RETURN collect(distinct label(n)) as labels"""
-        )
-        n_labels = n_labels_records[0]["labels"] if n_labels_records else []
-
-        return n_labels, e_labels
-
     def get(self, subj: str) -> List[List[str]]:
         """Get triplets."""
         query = """
@@ -209,5 +187,88 @@ class ApacheAGEGraphStore(GraphStore):
                         "detail": str(e),
                     }
                 )
+
+        return triplets
+
+    def get_labels(self) -> Tuple[List[str], List[str]]:
+        """
+        Get all labels of a graph (for both edges and vertices)
+        by querying the graph metadata table directly
+
+        Returns
+            Tuple[List[str]]: 2 lists, the first containing vertex
+                labels and the second containing edge labels
+        """
+
+        e_labels_records = self.query(
+            """MATCH ()-[e]-() RETURN collect(distinct label(e)) as labels"""
+        )
+        e_labels = e_labels_records[0]["labels"] if e_labels_records else []
+
+        n_labels_records = self.query(
+            """MATCH (n) RETURN collect(distinct label(n)) as labels"""
+        )
+        n_labels = n_labels_records[0]["labels"] if n_labels_records else []
+
+        return n_labels, e_labels
+
+    def get_triplets_from_edge_labels(
+        self, edge_labels: List[str]
+    ) -> List[Dict[str, str]]:
+        """
+        Get a set of distinct relationship types (as a list of dicts) in the graph
+        from the edge labels
+
+        Args:
+            edge_labels (List[str]): a list of edge labels to filter for
+
+        Returns:
+            List[Dict[str, str]]: relationships as a list of dicts in the format
+                "{'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}"
+        """
+
+        # age query to get distinct relationship types
+        try:
+            import psycopg2
+        except ImportError as e:
+            raise ImportError(
+                "Unable to import psycopg2, please install with "
+                "`pip install -U psycopg2`."
+            ) from e
+        query = """
+        SELECT * FROM ag_catalog.cypher('{graph_name}', $$
+            MATCH (a)-[e:`{edge_label}`]->(b)
+            WITH a,e,b LIMIT 3000
+            RETURN DISTINCT labels(a) AS from, type(e) AS edge, labels(b) AS to
+            LIMIT 10
+        $$) AS (f agtype, edge agtype, t agtype);
+        """
+
+        triplets = []
+
+        # iterate desired edge types and add distinct relationship types to result
+        with self._get_cursor() as curs:
+            for label in edge_labels:
+                q = query.format(graph_name=self.graph_name, edge_label=label)
+                try:
+                    curs.execute(q)
+                    data = curs.fetchall()
+                    for d in data:
+                        # use json.loads to convert returned
+                        # strings to python primitives
+                        triplets.append(
+                            {
+                                "start": json.loads(d.f)[0],
+                                "type": json.loads(d.edge),
+                                "end": json.loads(d.t)[0],
+                            }
+                        )
+                except psycopg2.Error as e:
+                    raise AGEQueryException(
+                        {
+                            "message": "Error fetching triplets",
+                            "detail": str(e),
+                        }
+                    )
 
         return triplets

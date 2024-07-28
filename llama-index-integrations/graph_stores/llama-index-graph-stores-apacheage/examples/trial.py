@@ -14,6 +14,7 @@ db = ApacheAGEGraphStore(
     node_label="Entity"
 )
 
-res = db.get(1688849860263938)
+# res = db.get(1688849860263938)
+res = db.get_triplets_from_edge_labels(["Animals"])
 # res = db.get_rel_map([1688849860263938])
 print(res)
