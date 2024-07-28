@@ -198,6 +198,51 @@ class ApacheAGEGraphStore(GraphStore):
                 )
 
         return triplets
+    
+    def get_rel_map(
+        self, subjs: Optional[List[str]] = None, depth: int = 2, limit: int = 30
+    ) -> Dict[str, List[List[str]]]:
+        """Get depth-aware rel map."""
+        formatted_subjs = [subj.lower() for subj in subjs] if subjs else []
+        query = """
+            SELECT * FROM ag_catalog.cypher('{graph_name}', $$
+            MATCH p=(n1:{node_label})-[*1..{depth}]->()
+            WHERE n1.id IN {formatted_subjs}
+            UNWIND relationships(p) AS rel
+            WITH n1.id AS subj, collect(DISTINCT (type(rel) + ':' + endNode(rel).id)) AS flattened_rels
+            RETURN subj, flattened_rels
+            LIMIT {limit}
+        $$) AS (subj agtype, flattened_rels agtype);
+        """
+        
+        rel_map: Dict[Any, List[Any]] = {}
+        if subjs is None or len(subjs) == 0:
+            # unlike simple graph_store, we don't do get_all here
+            return rel_map
+        
+        with self._get_cursor() as curs:
+            q = query.format(
+                graph_name=self.graph_name,
+                node_label=self.node_label,
+                depth=depth,
+                formatted_subjs=formatted_subjs,
+                limit=limit,
+            )
+            try:
+                curs.execute(q)
+                data = curs.fetchall()
+                if not data:
+                    return rel_map
+                for d in data:
+                    rel_map[d["subj"]] = d["flattened_rels"]
+            except psycopg2.Error as e:
+                raise AGEQueryException(
+                    {
+                        "message": "Error fetching triplets",
+                        "detail": str(e),
+                    }
+                )
+        
 
     def query(self, query: str, param_map: Optional[Dict[str, Any]] = {}) -> Any:
         """
