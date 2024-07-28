@@ -22,6 +22,7 @@ db = ApacheAGEGraphStore(
 # query = "MATCH p=()-[:married]-() RETURN p"
 # res = db.query(query)
 
-db.upsert_triplet("sub5", "rel", "sub6")
+# db.upsert_triplet("sub5", "rel", "sub6")
+db.delete("sub1", "REL", "sub2")
 
 # print(res)

@@ -273,6 +273,38 @@ class ApacheAGEGraphStore(GraphStore):
                     }
                 )
 
+    def delete(self, subj: str, rel: str, obj: str) -> None:
+        """
+        Delete triplet.
+        Deletes all edges of subj and obj, then proceedes to delete subj and obj nodes.
+        """
+
+        query = """
+            SELECT * FROM ag_catalog.cypher('{graph_name}', $$
+            MATCH (n1:{node_label} {{id: '{subj}'}})-[r:{rel}]->(n2:{node_label} {{id: '{obj}'}})
+            DETACH DELETE n1, n2
+            $$) as (n1 agtype);
+        """
+        with self._get_cursor() as curs:
+            q = query.format(
+                graph_name=self.graph_name,
+                node_label=self.node_label,
+                subj=subj,
+                obj=obj,
+                rel=rel,
+            )
+            try:
+                curs.execute(q)
+                self._driver.commit()
+            except psycopg2.Error as e:
+                self._driver.rollback()
+                raise AGEQueryException(
+                    {
+                        "message": "Error deleting edge (relationship)",
+                        "detail": str(e),
+                    }
+                )
+
     def query(self, query: str, param_map: Optional[Dict[str, Any]] = {}) -> Any:
         """
         Query the graph by taking a cypher query, converting it to an
@@ -320,15 +352,19 @@ class ApacheAGEGraphStore(GraphStore):
                 except JSONDecodeError as e:
                     logger.error(e)
                     logger.error(
-                        "Failed to convert to dict, returning NamedTuple. Try to return only simple data types."
+                        "Error in query(). Failed to convert to dict, returning NamedTuple. Try to return only simple data types."
                     )
                     result = [d for d in data]
                 except Exception as e:
                     logger.error(e)
-                    logger.error("Failed to convert to dict after query.")
+                    logger.error(
+                        "Error in query(). Failed to convert to dict after query -> {}".format(
+                            query
+                        )
+                    )
                     raise AGEQueryException(
                         {
-                            "message": "Failed to convert to dict after query.",
+                            "message": "Error in query(). Failed to convert to dict after query -> {}".format(query),
                             "detail": str(e),
                         }
                     )
