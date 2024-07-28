@@ -198,7 +198,7 @@ class ApacheAGEGraphStore(GraphStore):
                 )
 
         return triplets
-    
+
     def get_rel_map(
         self, subjs: Optional[List[str]] = None, depth: int = 2, limit: int = 30
     ) -> Dict[str, List[List[str]]]:
@@ -214,12 +214,12 @@ class ApacheAGEGraphStore(GraphStore):
             LIMIT {limit}
         $$) AS (subj agtype, flattened_rels agtype);
         """
-        
+
         rel_map: Dict[Any, List[Any]] = {}
         if subjs is None or len(subjs) == 0:
             # unlike simple graph_store, we don't do get_all here
             return rel_map
-        
+
         with self._get_cursor() as curs:
             q = query.format(
                 graph_name=self.graph_name,
@@ -242,7 +242,36 @@ class ApacheAGEGraphStore(GraphStore):
                         "detail": str(e),
                     }
                 )
-        
+
+    def upsert_triplet(self, subj: str, rel: str, obj: str) -> None:
+        """Add triplet."""
+        query = """
+            SELECT * FROM ag_catalog.cypher('{graph_name}', $$
+            MERGE (n1:{node_label} {{id:'{subj}'}})
+            MERGE (n2:{node_label} {{id:'{obj}'}})
+            MERGE (n1)-[:{rel}]->(n2)
+            $$) as (n1 agtype);
+        """
+
+        with self._get_cursor() as curs:
+            q = query.format(
+                graph_name=self.graph_name.strip(),
+                node_label=self.node_label.strip(),
+                subj=subj,
+                obj=obj,
+                rel=rel.replace(" ", "_").upper(),
+            )
+            try:
+                curs.execute(q)
+                self._driver.commit()
+            except psycopg2.Error as e:
+                self._driver.rollback()
+                raise AGEQueryException(
+                    {
+                        "message": "Error adding triplet",
+                        "detail": str(e),
+                    }
+                )
 
     def query(self, query: str, param_map: Optional[Dict[str, Any]] = {}) -> Any:
         """
