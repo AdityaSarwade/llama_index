@@ -157,6 +157,14 @@ class ApacheAGEGraphStore(GraphStore):
     @property
     def client(self) -> None:
         return self._driver
+    
+    def get_schema(self, refresh: bool = False) -> str:
+        """Get the schema of the Apache AGE Graph store."""
+        if self.schema and not refresh:
+            return self.schema
+        # self.refresh_schema()
+        logger.debug(f"get_schema() schema:\n{self.schema}")
+        return self.schema
 
     def get(self, subj: str) -> List[List[str]]:
         """Get triplets."""
