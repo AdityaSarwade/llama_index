@@ -6,11 +6,14 @@ from llama_index.core.base.llms.types import (
     ChatResponse,
     ChatResponseAsyncGen,
     ChatResponseGen,
+    ContentBlock,
     CompletionResponse,
     CompletionResponseAsyncGen,
     CompletionResponseGen,
     LLMMetadata,
     MessageRole,
+    TextBlock,
+    ImageBlock,
 )
 from llama_index.core.bridge.pydantic import Field, PrivateAttr
 from llama_index.core.callbacks import CallbackManager
@@ -35,31 +38,79 @@ from llama_index.llms.mistralai.utils import (
     mistralai_modelname_to_contextsize,
 )
 
-from mistralai.async_client import MistralAsyncClient
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ToolCall
+from mistralai import Mistral
+from mistralai.models import ToolCall
+from mistralai.models import (
+    Messages,
+    AssistantMessage,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+    TextChunk,
+    ImageURLChunk,
+    ContentChunk,
+)
 
 if TYPE_CHECKING:
     from llama_index.core.tools.types import BaseTool
 
-DEFAULT_MISTRALAI_MODEL = "mistral-tiny"
+DEFAULT_MISTRALAI_MODEL = "mistral-large-latest"
 DEFAULT_MISTRALAI_ENDPOINT = "https://api.mistral.ai"
 DEFAULT_MISTRALAI_MAX_TOKENS = 512
 
-from mistralai.models.chat_completion import ChatMessage as mistral_chatmessage
+
+def to_mistral_chunks(content_blocks: Sequence[ContentBlock]) -> Sequence[ContentChunk]:
+    content_chunks = []
+    for content_block in content_blocks:
+        if isinstance(content_block, TextBlock):
+            content_chunks.append(TextChunk(text=content_block.text))
+        elif isinstance(content_block, ImageBlock):
+            if content_block.url:
+                content_chunks.append(ImageURLChunk(url=content_block.url))
+            else:
+                base_64_str = (
+                    content_block.resolve_image(as_base64=True).read().decode("utf-8")
+                )
+                image_mimetype = content_block.image_mimetype
+                if not image_mimetype:
+                    raise ValueError(
+                        "Image mimetype not found in chat message image block"
+                    )
+
+                content_chunks.append(
+                    ImageURLChunk(
+                        image_url=f"data:{image_mimetype};base64,{base_64_str}"
+                    )
+                )
+        else:
+            raise ValueError(f"Unsupported content block type {type(content_block)}")
+
+    return content_chunks
 
 
 def to_mistral_chatmessage(
     messages: Sequence[ChatMessage],
-) -> List[mistral_chatmessage]:
+) -> List[Messages]:
     new_messages = []
     for m in messages:
         tool_calls = m.additional_kwargs.get("tool_calls")
-        new_messages.append(
-            mistral_chatmessage(
-                role=m.role.value, content=m.content, tool_calls=tool_calls
+        chunks = to_mistral_chunks(m.blocks)
+        if m.role == MessageRole.USER:
+            new_messages.append(UserMessage(content=chunks))
+        elif m.role == MessageRole.ASSISTANT:
+            new_messages.append(AssistantMessage(content=chunks, tool_calls=tool_calls))
+        elif m.role == MessageRole.SYSTEM:
+            new_messages.append(SystemMessage(content=chunks))
+        elif m.role == MessageRole.TOOL or m.role == MessageRole.FUNCTION:
+            new_messages.append(
+                ToolMessage(
+                    content=chunks,
+                    tool_call_id=m.additional_kwargs.get("tool_call_id"),
+                    name=m.additional_kwargs.get("name"),
+                )
             )
-        )
+        else:
+            raise ValueError(f"Unsupported message role {m.role}")
 
     return new_messages
 
@@ -83,6 +134,10 @@ class MistralAI(FunctionCallingLLM):
         # otherwise it will lookup MISTRAL_API_KEY from your env variable
         # llm = MistralAI(api_key="<api_key>")
 
+        # You can specify a custom endpoint by passing the `endpoint` variable or setting
+        # MISTRAL_ENDPOINT in your environment
+        # llm = MistralAI(endpoint="<endpoint>")
+
         llm = MistralAI()
 
         resp = llm.complete("Paul Graham is ")
@@ -97,8 +152,8 @@ class MistralAI(FunctionCallingLLM):
     temperature: float = Field(
         default=DEFAULT_TEMPERATURE,
         description="The temperature to use for sampling.",
-        gte=0.0,
-        lte=1.0,
+        ge=0.0,
+        le=1.0,
     )
     max_tokens: int = Field(
         default=DEFAULT_MISTRALAI_MAX_TOKENS,
@@ -107,24 +162,19 @@ class MistralAI(FunctionCallingLLM):
     )
 
     timeout: float = Field(
-        default=120, description="The timeout to use in seconds.", gte=0
+        default=120, description="The timeout to use in seconds.", ge=0
     )
     max_retries: int = Field(
-        default=5, description="The maximum number of API retries.", gte=0
+        default=5, description="The maximum number of API retries.", ge=0
     )
-    safe_mode: bool = Field(
-        default=False,
-        description="The parameter to enforce guardrails in chat generations.",
-    )
-    random_seed: str = Field(
+    random_seed: Optional[int] = Field(
         default=None, description="The random seed to use for sampling."
     )
     additional_kwargs: Dict[str, Any] = Field(
         default_factory=dict, description="Additional kwargs for the MistralAI API."
     )
 
-    _client: Any = PrivateAttr()
-    _aclient: Any = PrivateAttr()
+    _client: Mistral = PrivateAttr()
 
     def __init__(
         self,
@@ -157,19 +207,8 @@ class MistralAI(FunctionCallingLLM):
             )
 
         # Use the custom endpoint if provided, otherwise default to DEFAULT_MISTRALAI_ENDPOINT
-        endpoint = endpoint or DEFAULT_MISTRALAI_ENDPOINT
-
-        self._client = MistralClient(
-            api_key=api_key,
-            endpoint=endpoint,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-        self._aclient = MistralAsyncClient(
-            api_key=api_key,
-            endpoint=endpoint,
-            timeout=timeout,
-            max_retries=max_retries,
+        endpoint = get_from_param_or_env(
+            "endpoint", endpoint, "MISTRAL_ENDPOINT", DEFAULT_MISTRALAI_ENDPOINT
         )
 
         super().__init__(
@@ -189,6 +228,11 @@ class MistralAI(FunctionCallingLLM):
             output_parser=output_parser,
         )
 
+        self._client = Mistral(
+            api_key=api_key,
+            server_url=endpoint,
+        )
+
     @classmethod
     def class_name(cls) -> str:
         return "MistralAI_LLM"
@@ -200,7 +244,6 @@ class MistralAI(FunctionCallingLLM):
             num_output=self.max_tokens,
             is_chat_model=True,
             model_name=self.model,
-            safe_mode=self.safe_mode,
             random_seed=self.random_seed,
             is_function_calling_model=is_mistralai_function_calling_model(self.model),
         )
@@ -212,7 +255,8 @@ class MistralAI(FunctionCallingLLM):
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "random_seed": self.random_seed,
-            "safe_mode": self.safe_mode,
+            "retries": self.max_retries,
+            "timeout_ms": self.timeout * 1000,
         }
         return {
             **base_kwargs,
@@ -231,7 +275,7 @@ class MistralAI(FunctionCallingLLM):
 
         messages = to_mistral_chatmessage(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
-        response = self._client.chat(messages=messages, **all_kwargs)
+        response = self._client.chat.complete(messages=messages, **all_kwargs)
 
         tool_calls = response.choices[0].message.tool_calls
 
@@ -262,24 +306,20 @@ class MistralAI(FunctionCallingLLM):
         messages = to_mistral_chatmessage(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
 
-        response = self._client.chat_stream(messages=messages, **all_kwargs)
+        response = self._client.chat.stream(messages=messages, **all_kwargs)
 
         def gen() -> ChatResponseGen:
             content = ""
             for chunk in response:
-                delta = chunk.choices[0].delta
+                delta = chunk.data.choices[0].delta
                 role = delta.role or MessageRole.ASSISTANT
                 # NOTE: Unlike openAI, we are directly injecting the tool calls
                 additional_kwargs = {}
                 if delta.tool_calls:
                     additional_kwargs["tool_calls"] = delta.tool_calls
 
-                content_delta = delta.content
-                if content_delta is None:
-                    pass
-                    # continue
-                else:
-                    content += content_delta
+                content_delta = delta.content or ""
+                content += content_delta
                 yield ChatResponse(
                     message=ChatMessage(
                         role=role,
@@ -307,7 +347,9 @@ class MistralAI(FunctionCallingLLM):
 
         messages = to_mistral_chatmessage(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
-        response = await self._aclient.chat(messages=messages, **all_kwargs)
+        response = await self._client.chat.complete_async(
+            messages=messages, **all_kwargs
+        )
         tool_calls = response.choices[0].message.tool_calls
         return ChatResponse(
             message=ChatMessage(
@@ -336,24 +378,20 @@ class MistralAI(FunctionCallingLLM):
         messages = to_mistral_chatmessage(messages)
         all_kwargs = self._get_all_kwargs(**kwargs)
 
-        response = self._aclient.chat_stream(messages=messages, **all_kwargs)
+        response = await self._client.chat.stream_async(messages=messages, **all_kwargs)
 
         async def gen() -> ChatResponseAsyncGen:
             content = ""
             async for chunk in response:
-                delta = chunk.choices[0].delta
+                delta = chunk.data.choices[0].delta
                 role = delta.role or MessageRole.ASSISTANT
                 # NOTE: Unlike openAI, we are directly injecting the tool calls
                 additional_kwargs = {}
                 if delta.tool_calls:
                     additional_kwargs["tool_calls"] = delta.tool_calls
 
-                content_delta = delta.content
-                if content_delta is None:
-                    pass
-                    # continue
-                else:
-                    content += content_delta
+                content_delta = delta.content or ""
+                content += content_delta
                 yield ChatResponse(
                     message=ChatMessage(
                         role=role,
@@ -433,8 +471,7 @@ class MistralAI(FunctionCallingLLM):
         for tool_call in tool_calls:
             if not isinstance(tool_call, ToolCall):
                 raise ValueError("Invalid tool_call object")
-            if tool_call.type != "function":
-                raise ValueError("Invalid tool type. Unsupported by Mistralai.")
+
             argument_dict = json.loads(tool_call.function.arguments)
 
             tool_selections.append(
@@ -456,11 +493,11 @@ class MistralAI(FunctionCallingLLM):
             )
 
         if stop:
-            response = self._client.completion(
+            response = self._client.fim.complete(
                 model=self.model, prompt=prompt, suffix=suffix, stop=stop
             )
         else:
-            response = self._client.completion(
+            response = self._client.fim.complete(
                 model=self.model, prompt=prompt, suffix=suffix
             )
 

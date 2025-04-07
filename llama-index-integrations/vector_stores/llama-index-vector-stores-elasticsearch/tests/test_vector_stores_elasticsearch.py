@@ -29,6 +29,7 @@ from llama_index.vector_stores.elasticsearch.base import (
 )
 
 from llama_index.vector_stores.elasticsearch.utils import get_elasticsearch_client
+from llama_index.vector_stores.elasticsearch.base import _to_elasticsearch_filter
 
 ##
 # Start Elasticsearch locally
@@ -117,7 +118,7 @@ def node_embeddings() -> List[TextNode]:
             text="I was taught that the way of progress was neither swift nor easy.",
             id_="0b31ae71-b797-4e88-8495-031371a7752e",
             relationships={NodeRelationship.SOURCE: RelatedNodeInfo(node_id="text-3")},
-            metadate={
+            metadata={
                 "author": "Marie Curie",
             },
             embedding=[0.0, 0.0, 0.9],
@@ -129,7 +130,7 @@ def node_embeddings() -> List[TextNode]:
             ),
             id_="bd2e080b-159a-4030-acc3-d98afd2ba49b",
             relationships={NodeRelationship.SOURCE: RelatedNodeInfo(node_id="text-4")},
-            metadate={
+            metadata={
                 "author": "Albert Einstein",
             },
             embedding=[0.0, 0.0, 0.5],
@@ -141,7 +142,7 @@ def node_embeddings() -> List[TextNode]:
             ),
             id_="f658de3b-8cef-4d1c-8bed-9a263c907251",
             relationships={NodeRelationship.SOURCE: RelatedNodeInfo(node_id="text-5")},
-            metadate={
+            metadata={
                 "author": "Charlotte Bronte",
             },
             embedding=[0.0, 0.0, 0.3],
@@ -487,7 +488,7 @@ async def test_add_to_es_and_text_query_ranked_hybrid(
         query_str="human",
         query_embedding=[0.0, 0.0, 0.5],
         mode=VectorStoreQueryMode.HYBRID,
-        similarity_top_k=2,
+        similarity_top_k=3,
     )
     await check_top_match(
         es_hybrid_store, node_embeddings, use_async, query_get_1_first, node1, node2
@@ -549,3 +550,100 @@ async def check_top_match(
         res_node = res.nodes[idx]
         assert res_node.node_id == item.id
         assert 0 <= item.sim <= 1
+
+
+def test_metadata_filter_to_es_filter() -> None:
+    metadata_filters = MetadataFilters(
+        filters=[
+            ExactMatchFilter(key="k1", value="v1"),
+            ExactMatchFilter(key="k2", value="v2"),
+        ]
+    )
+    es_filter_default = _to_elasticsearch_filter(standard_filters=metadata_filters)
+    assert es_filter_default == {
+        "bool": {
+            "must": [
+                {"term": {"metadata.k1.keyword": {"value": "v1"}}},
+                {"term": {"metadata.k2.keyword": {"value": "v2"}}},
+            ]
+        }
+    }
+    es_filter_enum = _to_elasticsearch_filter(
+        standard_filters=metadata_filters, metadata_keyword_suffix=".enum"
+    )
+    assert es_filter_enum == {
+        "bool": {
+            "must": [
+                {"term": {"metadata.k1.enum": {"value": "v1"}}},
+                {"term": {"metadata.k2.enum": {"value": "v2"}}},
+            ]
+        }
+    }
+    es_filter_empty = _to_elasticsearch_filter(
+        standard_filters=metadata_filters, metadata_keyword_suffix=""
+    )
+    assert es_filter_empty == {
+        "bool": {
+            "must": [
+                {"term": {"metadata.k1": {"value": "v1"}}},
+                {"term": {"metadata.k2": {"value": "v2"}}},
+            ]
+        }
+    }
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("use_async", [True, False])
+async def test_delete_nodes(
+    es_store: ElasticsearchStore,
+    node_embeddings: List[TextNode],
+    use_async: bool,
+) -> None:
+    if use_async:
+        await es_store.async_add(node_embeddings)
+    else:
+        es_store.add(node_embeddings)
+
+    node_ids = [node_embeddings[0].node_id, node_embeddings[1].node_id]
+    if use_async:
+        await es_store.adelete_nodes(node_ids=node_ids)
+    else:
+        es_store.delete_nodes(node_ids=node_ids)
+
+    res = es_store.query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0], similarity_top_k=5)
+    )
+    assert len(res.nodes) == 4
+    assert all(node.node_id not in node_ids for node in res.nodes)
+
+    filters = MetadataFilters(
+        filters=[ExactMatchFilter(key="author", value="Marie Curie")]
+    )
+    if use_async:
+        await es_store.adelete_nodes(filters=filters)
+    else:
+        es_store.delete_nodes(filters=filters)
+
+    res = es_store.query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0], similarity_top_k=5)
+    )
+    assert len(res.nodes) == 3
+    assert all(node.metadata.get("author") != "Marie Curie" for node in res.nodes)
+
+    remaining_node_ids = [node.node_id for node in res.nodes[:2]]
+    filters = MetadataFilters(
+        filters=[ExactMatchFilter(key="author", value="Albert Einstein")]
+    )
+    if use_async:
+        await es_store.adelete_nodes(node_ids=remaining_node_ids, filters=filters)
+    else:
+        es_store.delete_nodes(node_ids=remaining_node_ids, filters=filters)
+
+    res = es_store.query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0], similarity_top_k=5)
+    )
+    assert len(res.nodes) == 2
+    assert any(node.metadata.get("author") == "Charlotte Bronte" for node in res.nodes)
+    assert any(
+        node.metadata.get("director") == "Christopher Nolan" for node in res.nodes
+    )

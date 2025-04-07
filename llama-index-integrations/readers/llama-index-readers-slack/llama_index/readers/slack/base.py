@@ -38,6 +38,7 @@ class SlackReader(BasePydanticReader):
     slack_token: str
     earliest_date_timestamp: Optional[float]
     latest_date_timestamp: float
+    channel_types: str
 
     _client: Any = PrivateAttr()
 
@@ -49,6 +50,7 @@ class SlackReader(BasePydanticReader):
         latest_date: Optional[datetime] = None,
         earliest_date_timestamp: Optional[float] = None,
         latest_date_timestamp: Optional[float] = None,
+        channel_types: Optional[str] = None,
     ) -> None:
         """Initialize with parameters."""
         from slack_sdk import WebClient
@@ -61,9 +63,9 @@ class SlackReader(BasePydanticReader):
                 "variable `SLACK_BOT_TOKEN`."
             )
         if ssl is None:
-            self._client = WebClient(token=slack_token)
+            client = WebClient(token=slack_token)
         else:
-            self._client = WebClient(token=slack_token, ssl=ssl)
+            client = WebClient(token=slack_token, ssl=ssl)
         if latest_date is not None and earliest_date is None:
             raise ValueError(
                 "Must specify `earliest_date` if `latest_date` is specified."
@@ -76,7 +78,11 @@ class SlackReader(BasePydanticReader):
             latest_date_timestamp = latest_date.timestamp()
         else:
             latest_date_timestamp = datetime.now().timestamp() or latest_date_timestamp
-        res = self._client.api_test()
+        if channel_types is not None:
+            channel_types = channel_types
+        else:
+            channel_types = "public_channel,private_channel"
+        res = client.api_test()
         if not res["ok"]:
             raise ValueError(f"Error initializing Slack API: {res['error']}")
 
@@ -84,7 +90,9 @@ class SlackReader(BasePydanticReader):
             slack_token=slack_token,
             earliest_date_timestamp=earliest_date_timestamp,
             latest_date_timestamp=latest_date_timestamp,
+            channel_types=channel_types,
         )
+        self._client = client
 
     @classmethod
     def class_name(cls) -> str:
@@ -243,13 +251,11 @@ class SlackReader(BasePydanticReader):
             return False
 
     def _list_channels(self) -> List[Dict[str, Any]]:
-        """List all channels (public and private)."""
+        """List channels based on the types."""
         from slack_sdk.errors import SlackApiError
 
         try:
-            result = self._client.conversations_list(
-                types="public_channel,private_channel"
-            )
+            result = self._client.conversations_list(types=self.channel_types)
             return result["channels"]
         except SlackApiError as e:
             logger.error(f"Error fetching channels: {e.response['error']}")

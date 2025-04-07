@@ -1,6 +1,6 @@
 # Agentic strategies
 
-You can build agents on top of your existing LlamaIndex RAG pipeline to empower it with automated decision capabilities.
+You can build agents on top of your existing LlamaIndex RAG workflow to empower it with automated decision capabilities.
 A lot of modules (routing, query transformations, and more) are already agentic in nature in that they use LLMs for decision making.
 
 ## Simpler Agentic Strategies
@@ -17,13 +17,12 @@ This guides below show you how to deploy a full agent loop, capable of chain-of-
 
 Make sure to check out our [full module guide on Data Agents](../../module_guides/deploying/agents/index.md), which highlight these use cases and much more.
 
-Our [lower-level agent API](../../module_guides/deploying/agents/agent_runner.md) shows you the internals of how an agent works (with step-wise execution).
+Our [lower-level agent API](../../module_guides/deploying/agents/index.md#manual-agents) shows you the internals of how an agent works (with step-wise execution).
 
 Example guides below (using OpenAI function calling):
 
-- [OpenAIAgent](../../examples/agent/openai_agent.ipynb)
+- [OpenAIAgent](../../examples/workflow/function_calling_agent.ipynb)
 - [OpenAIAgent with Query Engine Tools](../../examples/agent/openai_agent_with_query_engine.ipynb)
 - [OpenAIAgent Retrieval](../../examples/agent/openai_agent_retrieval.ipynb)
 - [OpenAIAgent Query Cookbook](../../examples/agent/openai_agent_query_cookbook.ipynb)
-- [OpenAIAgent Query Planning](../../examples/agent/openai_agent_query_plan.ipynb)
 - [OpenAIAgent Context Retrieval](../../examples/agent/openai_agent_context_retrieval.ipynb)

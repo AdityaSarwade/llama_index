@@ -7,6 +7,16 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import fsspec
+from redis import Redis
+from redis.exceptions import RedisError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from redisvl.index import SearchIndex
+from redisvl.query import CountQuery, FilterQuery, VectorQuery
+from redisvl.query.filter import FilterExpression, Tag
+from redisvl.redis.utils import array_to_buffer
+from redisvl.schema import IndexSchema
+from redisvl.schema.fields import BaseField
+
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import (
     BaseNode,
@@ -17,8 +27,8 @@ from llama_index.core.schema import (
 )
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
-    MetadataFilters,
     MetadataFilter,
+    MetadataFilters,
     VectorStoreQuery,
     VectorStoreQueryResult,
 )
@@ -27,26 +37,14 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
 )
 from llama_index.vector_stores.redis.schema import (
-    NODE_ID_FIELD_NAME,
-    NODE_CONTENT_FIELD_NAME,
     DOC_ID_FIELD_NAME,
+    NODE_CONTENT_FIELD_NAME,
+    NODE_ID_FIELD_NAME,
     TEXT_FIELD_NAME,
     VECTOR_FIELD_NAME,
     RedisVectorStoreSchema,
 )
 from llama_index.vector_stores.redis.utils import REDIS_LLAMA_FIELD_SPEC
-
-from redis import Redis
-from redis.exceptions import RedisError
-from redis.exceptions import TimeoutError as RedisTimeoutError
-
-from redisvl.index import SearchIndex
-from redisvl.schema import IndexSchema
-from redisvl.query import VectorQuery, FilterQuery, CountQuery
-from redisvl.query.filter import Tag, FilterExpression
-from redisvl.schema.fields import BaseField
-from redisvl.redis.utils import array_to_buffer
-
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +101,9 @@ class RedisVectorStore(BasePydanticVectorStore):
         )
     """
 
-    stores_text = True
-    stores_node = True
-    flat_metadata = False
+    stores_text: bool = True
+    stores_node: bool = True
+    flat_metadata: bool = False
 
     _index: SearchIndex = PrivateAttr()
     _overwrite: bool = PrivateAttr()
@@ -120,6 +118,7 @@ class RedisVectorStore(BasePydanticVectorStore):
         return_fields: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
+        super().__init__()
         # check for indicators of old schema
         self._flag_old_kwargs(**kwargs)
 
@@ -135,23 +134,13 @@ class RedisVectorStore(BasePydanticVectorStore):
             TEXT_FIELD_NAME,
             NODE_CONTENT_FIELD_NAME,
         ]
-        self._index = SearchIndex(schema=schema)
+        self._index = SearchIndex(
+            schema=schema, redis_client=redis_client, redis_url=redis_url
+        )
         self._overwrite = overwrite
-
-        # Establish redis connection
-        if redis_client:
-            self._index.set_client(redis_client)
-        elif redis_url:
-            self._index.connect(redis_url)
-        else:
-            raise ValueError(
-                "Failed to connect to Redis. Must provide a valid redis client or url"
-            )
 
         # Create index
         self.create_index()
-
-        super().__init__()
 
     def _flag_old_kwargs(self, **kwargs):
         old_kwargs = [
@@ -251,7 +240,7 @@ class RedisVectorStore(BasePydanticVectorStore):
                 NODE_ID_FIELD_NAME: node.node_id,
                 DOC_ID_FIELD_NAME: node.ref_doc_id,
                 TEXT_FIELD_NAME: node.get_content(metadata_mode=MetadataMode.NONE),
-                VECTOR_FIELD_NAME: array_to_buffer(embedding),
+                VECTOR_FIELD_NAME: array_to_buffer(embedding, dtype="FLOAT32"),
             }
             # parse and append metadata
             additional_metadata = node_to_metadata_dict(
@@ -345,15 +334,20 @@ class RedisVectorStore(BasePydanticVectorStore):
         if metadata_filters:
             if metadata_filters.filters:
                 for filter in metadata_filters.filters:
-                    # Index must be created with the metadata field in the index schema
-                    field = self._index.schema.fields.get(filter.key)
-                    if not field:
-                        logger.warning(
-                            f"{filter.key} field was not included as part of the index schema, and thus cannot be used as a filter condition."
-                        )
-                        continue
-                    # Extract redis filter
-                    redis_filter = self._to_redis_filter(field, filter)
+                    # Handle nested MetadataFilters recursively
+                    if isinstance(filter, MetadataFilters):
+                        redis_filter = self._create_redis_filter_expression(filter)
+                    else:
+                        # Index must be created with the metadata field in the index schema
+                        field = self._index.schema.fields.get(filter.key)
+                        if not field:
+                            logger.warning(
+                                f"{filter.key} field was not included as part of the index schema, and thus cannot be used as a filter condition."
+                            )
+                            continue
+                        # Extract redis filter
+                        redis_filter = self._to_redis_filter(field, filter)
+
                     # Combine with conditional
                     if metadata_filters.condition == "and":
                         filter_expression = filter_expression & redis_filter
@@ -426,9 +420,7 @@ class RedisVectorStore(BasePydanticVectorStore):
             raise ValueError("Query embedding is required for querying.")
 
         redis_query = self._to_redis_query(query)
-        logger.info(
-            f"Querying index {self._index.name} with filters {redis_query.get_filter()}"
-        )
+        logger.info(f"Querying index {self._index.name} with query {redis_query!s}")
 
         try:
             results = self._index.query(redis_query)
